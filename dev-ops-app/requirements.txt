@@ -1,0 +1,4 @@
+# Django
+django==3.0.2
+TEST
+mysqlclient==1.4.6
