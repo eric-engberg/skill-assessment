@@ -27,6 +27,10 @@ data "aws_ecs_task_definition" "mysql" {
   task_definition = aws_ecs_task_definition.mysql.family
 }
 
+data "aws_ecs_task_definition" "app" {
+  task_definition = aws_ecs_task_definition.app.family
+}
+
 data "aws_iam_policy_document" "ecs_instance_policy" {
   statement {
     actions = ["sts:AssumeRole"]
@@ -192,6 +196,12 @@ resource "aws_security_group" "ecs" {
   vpc_id      = aws_vpc.skill_assessment.id
 }
 
+resource "aws_security_group" "mysql" {
+  name        = "MySQL Security Group"
+  description = "MySQL Security Group"
+  vpc_id      = aws_vpc.skill_assessment.id
+}
+
 resource "aws_security_group_rule" "ssh" {
   type            = "ingress"
   from_port       = 22
@@ -203,23 +213,52 @@ resource "aws_security_group_rule" "ssh" {
 }
 
 resource "aws_security_group_rule" "self-ssh" {
-  type            = "ingress"
-  from_port       = 22
-  to_port         = 22
-  protocol        = "tcp"
+  type      = "ingress"
+  from_port = 22
+  to_port   = 22
+  protocol  = "tcp"
 
-  security_group_id = aws_security_group.ecs.id
+  security_group_id        = aws_security_group.ecs.id
   source_security_group_id = aws_security_group.ecs.id
 }
 
-resource "aws_security_group_rule" "all-egress" {
-  type            = "egress"
-  from_port       = 0
-  to_port         = 0
-  protocol        = "-1"
+resource "aws_security_group_rule" "ecs_app" {
+  type            = "ingress"
+  from_port       = 8000
+  to_port         = 8000
+  protocol        = "tcp"
   cidr_blocks     = ["0.0.0.0/0"]
 
   security_group_id = aws_security_group.ecs.id
+}
+
+resource "aws_security_group_rule" "all-egress" {
+  type        = "egress"
+  from_port   = 0
+  to_port     = 0
+  protocol    = "-1"
+  cidr_blocks = ["0.0.0.0/0"]
+
+  security_group_id = aws_security_group.ecs.id
+}
+
+resource "aws_security_group_rule" "mysql-ingress" {
+  type      = "ingress"
+  from_port = 3306
+  to_port   = 3306
+  protocol  = "tcp"
+
+  security_group_id        = aws_security_group.mysql.id
+  source_security_group_id = aws_security_group.ecs.id
+}
+
+resource "aws_ecr_repository" "skill_assessment" {
+  name                 = "dev-ops-app"
+  image_tag_mutability = "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
 }
 
 resource "aws_service_discovery_private_dns_namespace" "local" {
@@ -254,6 +293,16 @@ resource "aws_iam_role_policy_attachment" "ecs_instance_role_attachment" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
 }
 
+resource "aws_iam_role_policy_attachment" "ecs_instance_logs_attachment" {
+  role = aws_iam_role.ecs_instance_role.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchLogsFullAccess"
+}
+
+resource "aws_iam_role_policy_attachment" "ecs_instance_ecr_attachment" {
+  role = aws_iam_role.ecs_instance_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess"
+}
+
 resource "aws_iam_role_policy_attachment" "ecs_instance_ssm_attachment" {
   role = aws_iam_role.ecs_instance_role.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
@@ -279,7 +328,7 @@ resource "aws_iam_role_policy_attachment" "ecs_service_role_attachment" {
 resource "aws_launch_configuration" "ecs_launch_configuration" {
   name = "ecs_launch_configuration"
   image_id = "ami-07a63940735aebd38"
-  instance_type = "t2.small"
+  instance_type = "t3.small"
   iam_instance_profile = aws_iam_instance_profile.ecs_instance_profile.id
   associate_public_ip_address = true
   key_name = aws_key_pair.ssh_key.key_name
@@ -308,6 +357,12 @@ resource "aws_autoscaling_group" "ecs_autoscaling_group" {
   vpc_zone_identifier = aws_subnet.ec2.*.id
   launch_configuration = aws_launch_configuration.ecs_launch_configuration.name
   health_check_type = "EC2"
+
+  tag {
+    key                 = "Name"
+    value               = "Skill Assessment ECS"
+    propagate_at_launch = true
+  }
 
   depends_on = [aws_launch_configuration.ecs_launch_configuration]
 }
@@ -346,24 +401,18 @@ resource "aws_ecs_task_definition" "mysql" {
               awslogs-group         = "/ecs/mysql"
               awslogs-region        = "us-east-1"
               awslogs-stream-prefix = "ecs"
+              awslogs-create-group  = "true"
             }
           }
           mountPoints      = []
           name             = "mysql"
-          portMappings     = [
-            {
-              containerPort = 8000
-              hostPort      = 8000
-              protocol      = "tcp"
-            },
-          ]
           volumesFrom      = []
          },
       ]
     )
     cpu                      = "128"
     family                   = "mysql"
-    memory                   = "1024"
+    memory                   = "256"
     network_mode             = "awsvpc"
     requires_compatibilities = [
         "EC2",
@@ -392,7 +441,7 @@ resource "aws_ecs_service" "mysql" {
 
   network_configuration {
       assign_public_ip = false
-      security_groups  = [ aws_security_group.ecs.id ]
+      security_groups  = [ aws_security_group.mysql.id ]
       subnets          = aws_subnet.container.*.id
   }
 
@@ -407,4 +456,116 @@ resource "aws_ecs_service" "mysql" {
   service_registries {
     registry_arn   = aws_service_discovery_service.mysql.arn
   }
+}
+
+resource "null_resource" "ecr_login" {
+  provisioner "local-exec" {
+    command = "$(aws ecr get-login --no-include-email --region us-east-1)"
+  }
+}
+
+resource "null_resource" "build" {
+  provisioner "local-exec" {
+    command = "docker build -t dev-ops-app ."
+  }
+}
+
+resource "null_resource" "tag" {
+  provisioner "local-exec" {
+    command = "docker tag dev-ops-app:latest ${aws_ecr_repository.skill_assessment.repository_url}:latest"
+  }
+  depends_on = [null_resource.build]
+}
+
+resource "null_resource" "push" {
+  provisioner "local-exec" {
+    command = "docker push ${aws_ecr_repository.skill_assessment.repository_url}:latest"
+  }
+  depends_on = [null_resource.tag]
+}
+
+resource "aws_ecs_task_definition" "app" {
+    container_definitions    = jsonencode(
+      [
+        {
+          cpu              = 0
+          essential        = true
+          image            = "${aws_ecr_repository.skill_assessment.repository_url}:latest"
+          logConfiguration = {
+            logDriver = "awslogs"
+            options   = {
+              awslogs-group         = "/ecs/app"
+              awslogs-region        = "us-east-1"
+              awslogs-stream-prefix = "ecs"
+              awslogs-create-group  = "true"
+            }
+          }
+          mountPoints      = []
+          name             = "app"
+          portMappings     = [
+            {
+              containerPort = 8000
+              hostPort      = 8000
+              protocol      = "tcp"
+            },
+          ]
+          volumesFrom      = []
+         },
+      ]
+    )
+    cpu                      = "128"
+    family                   = "app"
+    memory                   = "256"
+    network_mode             = "bridge"
+    requires_compatibilities = [
+        "EC2",
+    ]
+    tags                     = {}
+}
+
+resource "aws_ecs_service" "app" {
+  cluster                            = aws_ecs_cluster.ut_skill_assessment.id
+  deployment_maximum_percent         = 200
+  deployment_minimum_healthy_percent = 100
+  desired_count                      = 1
+  enable_ecs_managed_tags            = false
+  health_check_grace_period_seconds  = 0
+  #iam_role                           = "aws-service-role"
+  launch_type                        = "EC2"
+  name                               = "app"
+  #propagate_tags                     = "NONE"
+  scheduling_strategy                = "REPLICA"
+  tags                               = {}
+  task_definition                    = "${aws_ecs_task_definition.app.family}:${max(aws_ecs_task_definition.app.revision, data.aws_ecs_task_definition.app.revision)}"
+
+  deployment_controller {
+      type = "ECS"
+  }
+
+  #network_configuration {
+  #    assign_public_ip = false
+  #    security_groups  = [ aws_security_group.app.id ]
+  #    subnets          = aws_subnet.container.*.id
+  #}
+
+  ordered_placement_strategy {
+      field = "attribute:ecs.availability-zone"
+      type  = "spread"
+  }
+  ordered_placement_strategy {
+      field = "instanceId"
+      type  = "spread"
+  }
+  depends_on = [aws_ecs_service.mysql]
+}
+
+data "aws_instance" "ecs" {
+  instance_tags = {
+    Name = "Skill Assessment ECS"
+  }
+  depends_on = [aws_autoscaling_group.ecs_autoscaling_group]
+}
+
+output "url" {
+  value = "http://${data.aws_instance.ecs.public_ip}:8000"
 }
