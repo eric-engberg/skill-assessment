@@ -521,6 +521,7 @@ resource "aws_ecs_task_definition" "app" {
         "EC2",
     ]
     tags                     = {}
+    depends_on = [null_resource.push]
 }
 
 resource "aws_ecs_service" "app" {
@@ -556,16 +557,16 @@ resource "aws_ecs_service" "app" {
       field = "instanceId"
       type  = "spread"
   }
-  depends_on = [aws_ecs_service.mysql]
+  depends_on = [aws_ecs_service.mysql, aws_ecs_task_definition.app]
 }
 
-data "aws_instance" "ecs" {
-  instance_tags = {
-    Name = "Skill Assessment ECS"
-  }
-  depends_on = [aws_autoscaling_group.ecs_autoscaling_group]
-}
+# data "aws_instance" "ecs" {
+#   count = aws_autoscaling_group.ecs_autoscaling_group.id ? 1 : 0
+#   instance_tags = {
+#     Name = "Skill Assessment ECS"
+#   }
+# }
 
-output "url" {
-  value = "http://${data.aws_instance.ecs.public_ip}:8000"
-}
+#  output "url" {
+#    value = "http://${data.aws_instance.ecs[0].public_ip}:8000"
+#  }
